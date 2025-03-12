@@ -1,0 +1,273 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: |
+  Creates a Lambda function that forwards received emails to the same recipient
+  at a new domain (e.g., john.doe@hello.com to john.doe@world.com).
+
+Parameters:
+  SesReceiptS3BucketName:
+    Type: String
+    AllowedPattern: ^[a-zA-Z0-9][.a-zA-Z0-9-]{1,61}[a-zA-Z0-9]$
+    Description: |
+      The BucketName of SES S3Action Receipt Rule.
+
+      Example - my-bucket-name
+
+  SesReceiptS3ObjectKeyPrefix:
+    Type: String
+    AllowedPattern: ^([a-zA-Z0-9.-_]+/)*$
+    Description: |
+      The ObjectKeyPrefix of SES S3Action Receipt Rule.
+
+      Example - received/
+
+  SesForwardingSender:
+    Type: String
+    AllowedPattern: ^[-a-zA-Z0-9._+]+@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?[.])+[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$
+    Description: The email address to use to forward emails. Must be verified in
+      SES. Example - hello@example.com
+
+  SourceEmailDomain:
+    Type: String
+    AllowedPattern: ^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?[.])+[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$
+    Description: |
+      The domain to forward emails from.
+
+      Example - To forward from john.doe@source.com to john.doe@target.com, use "source.com".
+
+  TargetEmailDomain:
+    Type: String
+    AllowedPattern: ^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?[.])+[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$
+    Description: |
+      The domain to forward emails to.
+
+      Example - To forward from john.doe@source.com to john.doe@target.com, use "target.com".
+
+Resources:
+  EmailForwarderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EmailForwarder
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3GetObjectPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: VisualEditor0
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:aws:s3:::${SesReceiptS3BucketName}/${SesReceiptS3ObjectKeyPrefix}*
+              - Sid: VisualEditor1
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::${SesReceiptS3BucketName}"
+        - PolicyName: SESSendRawEmailPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: VisualEditor0
+                Effect: Allow
+                Action: ses:SendRawEmail
+                Resource: !Sub arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/*
+
+  EmailForwarderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: EmailForwarderFunction
+      Handler: index.lambda_handler
+      Role: !GetAtt EmailForwarderRole.Arn
+      Runtime: python3.12
+      Code:
+        ZipFile: |
+          # Adapted from https://aws.amazon.com/blogs/messaging-and-targeting/forward-incoming-email-to-an-external-destination/
+
+          # Copyright 2010-2019 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+          #
+          # This file is licensed under the Apache License, Version 2.0 (the "License").
+          # You may not use this file except in compliance with the License. A copy of the
+          # License is located at
+          #
+          # http://aws.amazon.com/apache2.0/
+          #
+          # This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS
+          # OF ANY KIND, either express or implied. See the License for the specific
+          # language governing permissions and limitations under the License.
+
+          # This file was subsequently edited by Andy Boothe to make the Lambda function
+          # forward emails to per-recipient addresses based on the domain of the original
+          # recipient, as opposed to one single recipient for all emails.
+
+          import os
+          import boto3
+          import email
+          import re
+          from botocore.exceptions import ClientError
+          from email.mime.multipart import MIMEMultipart
+          from email.mime.text import MIMEText
+          from email.mime.application import MIMEApplication
+
+          AWS_REGION = os.environ['AWS_REGION']
+          SES_RECEIPT_S3_BUCKET_NAME = os.environ['SES_RECEIPT_S3_BUCKET_NAME']
+          SES_RECEIPT_S3_OBJECT_KEY_PREFIX = os.environ['SES_RECEIPT_S3_OBJECT_KEY_PREFIX']
+          SES_FORWARDING_SENDER = os.environ['SES_FORWARDING_SENDER']
+          SOURCE_EMAIL_DOMAIN = os.environ['SOURCE_EMAIL_DOMAIN']
+          TARGET_EMAIL_DOMAIN = os.environ['TARGET_EMAIL_DOMAIN']
+
+          def get_message_from_s3(message_id):
+              if SES_RECEIPT_S3_OBJECT_KEY_PREFIX:
+                  object_path = (SES_RECEIPT_S3_OBJECT_KEY_PREFIX + message_id)
+              else:
+                  object_path = message_id
+
+              object_http_path = (
+                  f"http://s3.console.aws.amazon.com/s3/object/{SES_RECEIPT_S3_BUCKET_NAME}/{object_path}?region={AWS_REGION}")
+
+              # Create a new S3 client.
+              client_s3 = boto3.client("s3")
+
+              # Get the email object from the S3 bucket.
+              object_s3 = client_s3.get_object(Bucket=SES_RECEIPT_S3_BUCKET_NAME,
+                                               Key=object_path)
+              # Read the content of the message.
+              file = object_s3['Body'].read()
+
+              file_dict = {
+                  "file": file,
+                  "path": object_http_path
+              }
+
+              return file_dict
+
+
+          def create_message(file_dict):
+              global SES_FORWARDING_SENDER
+              global SOURCE_EMAIL_DOMAIN
+              global TARGET_EMAIL_DOMAIN
+
+              separator = ";"
+
+              # Parse the email body.
+              mailobject = email.message_from_string(file_dict['file'].decode('utf-8'))
+
+              # Extract recipients from the "To" header, filter to only those at "source.com" and rewrite domain to "target.com"
+              to_header = mailobject.get('To', '')
+              addresses = email.utils.getaddresses([to_header])
+              filtered = []
+              for name, addr in addresses:
+                  if '@' in addr:
+                      local, domain = addr.split('@', 1)
+                      if domain.lower() == SOURCE_EMAIL_DOMAIN:
+                          new_addr = f"{local}@{TARGET_EMAIL_DOMAIN}"
+                          # Preserve the display name if it exists
+                          if name:
+                              new_addr = email.utils.formataddr((name, new_addr))
+                          filtered.append(new_addr)
+              recipient = ", ".join(filtered) if filtered else ""
+
+              # Create a new subject line.
+              subject_original = mailobject['Subject']
+              subject = "FW: " + subject_original
+
+              # The body text of the email.
+              body_text = ("The attached message was received from "
+                           + separator.join(mailobject.get_all('From'))
+                           + ". This message is archived at " + file_dict['path'])
+
+              # The file name to use for the attached message. Uses regex to remove all
+              # non-alphanumeric characters, and appends a file extension.
+              filename = re.sub('[^0-9a-zA-Z]+', '_', subject_original) + ".eml"
+
+              # Create a MIME container.
+              msg = MIMEMultipart()
+              # Create a MIME text part.
+              text_part = MIMEText(body_text, _subtype="html")
+              # Attach the text part to the MIME message.
+              msg.attach(text_part)
+
+              # Add subject, from and to lines.
+              msg['Subject'] = subject
+              msg['From'] = SES_FORWARDING_SENDER
+              msg['To'] = recipient
+
+              # Create a new MIME object.
+              att = MIMEApplication(file_dict["file"], filename)
+              att.add_header("Content-Disposition", 'attachment', filename=filename)
+
+              # Attach the file object to the message.
+              msg.attach(att)
+
+              message = {
+                  "Source": SES_FORWARDING_SENDER,
+                  "Destinations": recipient,
+                  "Data": msg.as_string(),
+                  "Message": msg
+              }
+
+              return message
+
+
+          def send_email(message):
+              aws_region = os.environ['AWS_REGION']
+
+              # Create a new SES client.
+              client_ses = boto3.client('ses', region_name=AWS_REGION)
+
+              # Send the email.
+              try:
+                  # Provide the contents of the email.
+                  response = client_ses.send_raw_email(
+                      Source=message['Source'],
+                      Destinations=[
+                          message['Destinations']
+                      ],
+                      RawMessage={
+                          'Data': message['Data']
+                      }
+                  )
+
+              # Display an error if something goes wrong.
+              except ClientError as e:
+                  output = e.response['Error']['Message']
+              else:
+                  output = "Email sent! Message ID: " + response['MessageId']
+
+              return output
+
+
+          def lambda_handler(event, context):
+              # Get the unique ID of the message. This corresponds to the name of the file
+              # in S3.
+              message_id = event['Records'][0]['ses']['mail']['messageId']
+              print(f"Received message ID {message_id}")
+
+              # Retrieve the file from the S3 bucket.
+              file_dict = get_message_from_s3(message_id)
+
+              # Create the message.
+              message = create_message(file_dict)
+
+              if message['Message']['To'].strip() == "":
+                  # No recipients matched our source domain.
+                  result = "Email ignored. No matching recipients."
+              else:
+                  # Send the email and print the result.
+                  result = send_email(message)
+
+              print(result)
+      Environment:
+        Variables:
+          SES_RECEIPT_S3_BUCKET_NAME: !Ref SesReceiptS3BucketName
+          SES_RECEIPT_S3_OBJECT_KEY_PREFIX: !Ref SesReceiptS3ObjectKeyPrefix
+          SES_FORWARDING_SENDER: !Ref SesForwardingSender
+          SOURCE_EMAIL_DOMAIN: !Ref SourceEmailDomain
+          TARGET_EMAIL_DOMAIN: !Ref TargetEmailDomain
+      Timeout: 120
